@@ -341,6 +341,12 @@ def init_db():
             with engine.begin() as c:
                 c.execute(text(f"DROP TABLE IF EXISTS {table}_old"))
                 c.execute(text(f"ALTER TABLE {table} RENAME TO {table}_old"))
+                for ix in ("ix_bs_barber", "ix_bb_barber", "ix_bb_user", "ux_bb_active"):
+                    try:
+                        with c.begin_nested():
+                            c.execute(text(f"DROP INDEX IF EXISTS {ix}"))
+                    except Exception:
+                        pass
             rebuilt = True
     if rebuilt:
         _create_tables()
@@ -377,13 +383,18 @@ def _migrate():
                        "status VARCHAR(12) DEFAULT 'active'", "cancelled_by VARCHAR(10)",
                        "created_at TIMESTAMP", "reminded INTEGER DEFAULT 0"],
     }
-    for table, defs in cols.items():
-        for d in defs:
-            try:
-                with engine.begin() as c:
-                    c.execute(text(f"ALTER TABLE {table} ADD COLUMN {ine}{d}"))
-            except Exception:
-                pass  # ustun allaqachon bor
+    stmts = [f"ALTER TABLE {t} ADD COLUMN {ine}{d}" for t, defs in cols.items() for d in defs]
+    if ine:  # Postgres: bitta tranzaksiyada (tez)
+        with engine.begin() as c:
+            for q in stmts:
+                c.execute(text(q))
+        return
+    for q in stmts:
+        try:
+            with engine.begin() as c:
+                c.execute(text(q))
+        except Exception:
+            pass  # ustun allaqachon bor
 
 
 # ---- foydalanuvchi / til ----
@@ -845,7 +856,7 @@ def api_init(user, b):
                "bot": BOT_USERNAME},
         "now": now_local().strftime("%Y-%m-%d %H:%M"),
         "catalog": catalog_list(user["lang"]),
-        "barbers": cached("barbers", 20, _build_barbers),
+        "barbers": cached("barbers", 45, _build_barbers),
     }
 
 
@@ -882,8 +893,36 @@ def _build_barbers():
                            "AND end_at > :s AND start_at < :e", {"s": now, "e": until}):
         busy_all.setdefault(bid, []).append((to_dt(s), to_dt(e)))
     out = []
-    for r in q_all(f"SELECT {B_COLS} FROM barbers WHERE active=1 ORDER BY id"):
+    rows = q_all(f"SELECT {B_COLS} FROM barbers WHERE active=1 ORDER BY id")
+    # bazaga ko'p marta emas, bir martada: xizmat, ish vaqti, dam olish kunlarini ommaviy olib keshga yozamiz
+    ids = [r[0] for r in rows]
+    if ids:
+        exp = time.time() + 60
+        today = now.date().isoformat()
+        svs, hrs, offs = {i: [] for i in ids}, {i: [] for i in ids}, {i: [] for i in ids}
+        for r in q_all("SELECT id, kind, name, price, duration, active, barber_id FROM b_services "
+                       "WHERE active=1 ORDER BY sort_order, id"):
+            if r[6] in svs:
+                svs[r[6]].append(_sv(r[:6]))
+        for r in q_all("SELECT weekday, open_t, close_t, is_off, br_start, br_end, barber_id FROM b_hours"):
+            if r[6] in hrs:
+                hrs[r[6]].append({"weekday": r[0], "open": r[1] or "09:00", "close": r[2] or "20:00",
+                                  "off": bool(r[3]), "br_start": r[4] or "", "br_end": r[5] or ""})
+        for r in q_all("SELECT d, barber_id FROM b_daysoff WHERE d >= :t ORDER BY d", {"t": today}):
+            if r[1] in offs:
+                offs[r[1]].append(r[0])
+        for i in ids:
+            have = {h["weekday"] for h in hrs[i]}
+            for wd in range(7):
+                if wd not in have:
+                    hrs[i].append({"weekday": wd, "open": "09:00", "close": "20:00", "off": wd == 6,
+                                   "br_start": "", "br_end": ""})
+            _CACHE[f"sv:{i}:1"] = (exp, svs[i])
+            _CACHE[f"h:{i}"] = (exp, sorted(hrs[i], key=lambda h: h["weekday"]))
+            _CACHE[f"do:{i}:{today}"] = (exp, offs[i])
+    for r in rows:
         bb = _barber(r)
+        _CACHE[f"b:{bb['id']}"] = (time.time() + 60, bb)
         svs = list_services(bb["id"], True)
         if not svs:
             continue
@@ -898,7 +937,7 @@ def _build_barbers():
 
 
 def api_barbers(user, b):
-    return {"barbers": cached("barbers", 20, _build_barbers)}
+    return {"barbers": cached("barbers", 45, _build_barbers)}
 
 
 def _public_barber(bid, user):
@@ -1293,7 +1332,7 @@ def page_bytes():
 def _warm():
     """Sahifa so'ralgan zahoti bazani uyg'otib, sartaroshlar ro'yxatini keshga olamiz."""
     try:
-        cached("barbers", 20, _build_barbers)
+        cached("barbers", 45, _build_barbers)
     except Exception:
         pass
 
@@ -1414,13 +1453,19 @@ class Web(BaseHTTPRequestHandler):
         except Exception:
             self._json(400, {"error": tr(lg, "So'rov noto'g'ri")})
             return
+        t0 = time.time()
         try:
             self._json(200, fn(user, body))
         except ApiError as e:
             self._json(e.code, {"error": tr(lg, e.msg, **e.kw)})
-        except Exception:
+        except Exception as e:
+            log.error("API XATOSI %s: %s: %s", path, type(e).__name__, str(e).splitlines()[0][:300] if str(e) else "")
             log.exception("API xatosi: %s", path)
             self._json(500, {"error": tr(lg, "Server xatosi, birozdan keyin qayta urinib ko'ring")})
+        finally:
+            took = time.time() - t0
+            if took > 1.0:
+                log.warning("SEKIN so'rov: %s %.1f s", path, took)
 
     def log_message(self, *a):
         pass
@@ -1497,7 +1542,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     def work():
         lg = get_lang(u.id) or lang_from_code(u.language_code)
         try:
-            cached("barbers", 20, _build_barbers)  # bazani va ro'yxatni oldindan isitamiz
+            cached("barbers", 45, _build_barbers)  # bazani va ro'yxatni oldindan isitamiz
         except Exception:
             pass
         return lg, _start_payload(u.id, u.first_name, lg, deep)
@@ -1610,8 +1655,8 @@ async def post_init(app: Application):
 
 
 def main():
+    start_server()  # port darhol ochilsin (Render tekshiradi)
     init_db()
-    start_server()
     app = (Application.builder().token(BOT_TOKEN).concurrent_updates(True)
            .get_updates_read_timeout(30).post_init(post_init).build())
     app.add_handler(CommandHandler("start", cmd_start))
